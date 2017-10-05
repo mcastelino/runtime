@@ -57,7 +57,7 @@ const (
 // DefaultNetInterworkingModel is a package level default
 // that determines how the VM should be connected to the
 // the container network interface
-var DefaultNetInterworkingModel NetInterworkingModel = ModelBridged
+var DefaultNetInterworkingModel NetInterworkingModel = ModelMacVtap
 
 // Introduces constants related to network routes.
 const (
@@ -270,6 +270,10 @@ func getLinkByName(netHandle *netlink.Handle, name string, expectedLink netlink.
 		}
 	case (&netlink.Veth{}).Type():
 		if l, ok := link.(*netlink.Veth); ok {
+			return l, nil
+		}
+	case (&netlink.Macvtap{}).Type():
+		if l, ok := link.(*netlink.Macvtap); ok {
 			return l, nil
 		}
 	default:
