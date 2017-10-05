@@ -25,10 +25,12 @@
 package qemu
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 
@@ -332,16 +334,70 @@ func (cdev CharDevice) QemuParams(config *Config) []string {
 	return qemuParams
 }
 
-// NetDeviceType is a qemu networing device type.
+// NetDeviceType is a qemu networking device type.
 type NetDeviceType string
 
 const (
 	// TAP is a TAP networking device type.
 	TAP NetDeviceType = "tap"
 
-	// MACVTAP is a MAC virtual TAP networking device type.
+	// MACVTAP is a macvtap networking device type.
 	MACVTAP = "macvtap"
+
+	// IPVTAP is a ipvtap virtual networking device type.
+	IPVTAP = "ipvtap"
+
+	// VETHTAP is a veth-tap virtual networking device type.
+	VETHTAP = "vethtap"
+
+	// VFIO is a direct assigned PCI device or PCI VF
+	VFIO = "VFIO"
+
+	// VHOSTUSER is a vhost-user port (socket)
+	VHOSTUSER = "vhostuser"
 )
+
+// QemuString converts to the QEMU -netdev parameter notation
+func (n NetDeviceType) QemuNetdevParam() string {
+	switch n {
+	case TAP:
+		return "tap"
+	case MACVTAP:
+		return "tap"
+	case IPVTAP:
+		return "tap"
+	case VETHTAP:
+		return "tap" // -netdev type=tap -device virtio-net-pci
+	case VFIO:
+		return "" // -device vfio-pci (no netdev)
+	case VHOSTUSER:
+		return "vhost-user" // -netdev type=vhost-user (no device)
+	default:
+		return ""
+
+	}
+}
+
+// QemuString converts to the QEMU -device parameter notation
+func (n NetDeviceType) QemuDeviceParam() string {
+	switch n {
+	case TAP:
+		return "virtio-net-pci"
+	case MACVTAP:
+		return "virtio-net-pci"
+	case IPVTAP:
+		return "virtio-net-pci"
+	case VETHTAP:
+		return "virtio-net-pci" // -netdev type=tap -device virtio-net-pci
+	case VFIO:
+		return "vfio-pci" // -device vfio-pci (no netdev)
+	case VHOSTUSER:
+		return "" // -netdev type=vhost-user (no device)
+	default:
+		return ""
+
+	}
+}
 
 // NetDevice represents a guest networking device
 type NetDevice struct {
@@ -399,23 +455,68 @@ func (netdev NetDevice) Valid() bool {
 	}
 }
 
+func cleanupFds(fds []*os.File, numFds int) {
+
+	maxFds := len(fds)
+
+	if numFds < maxFds {
+		maxFds = numFds
+	}
+
+	for i := 0; i < maxFds; i++ {
+		_ = fds[i].Close()
+	}
+}
+
+func createMacvtapFds(name string, queues int) ([]*os.File, error) {
+
+	fds := make([]*os.File, queues)
+
+	ifIndexPath := path.Join("/sys/class/net", name, "ifindex")
+	fip, err := os.Open(ifIndexPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fip.Close() }()
+
+	scan := bufio.NewScanner(fip)
+	if !scan.Scan() {
+		return nil, fmt.Errorf("Unable to read tap index")
+	}
+
+	i, err := strconv.Atoi(scan.Text())
+	if err != nil {
+		return nil, err
+	}
+
+	//mq support
+	for q := 0; q < queues; q++ {
+
+		tapDev := fmt.Sprintf("/dev/tap%d", i)
+
+		f, err := os.OpenFile(tapDev, os.O_RDWR, 0666)
+		if err != nil {
+			cleanupFds(fds, q)
+			return nil, err
+		}
+		fds[q] = f
+	}
+
+	return fds, nil
+}
+
 // QemuParams returns the qemu parameters built out of this network device.
 func (netdev NetDevice) QemuParams(config *Config) []string {
 	var netdevParams []string
 	var deviceParams []string
 	var qemuParams []string
 
-	if netdev.Driver == VirtioNetPCI {
+	if netdev.Type.QemuDeviceParam() != "" {
 		deviceParams = append(deviceParams, "driver=")
-	}
-	deviceParams = append(deviceParams, fmt.Sprintf("%s", netdev.Driver))
-	if netdev.DisableModern {
-		deviceParams = append(deviceParams, ",disable-modern=true")
-	}
-	deviceParams = append(deviceParams, fmt.Sprintf(",netdev=%s", netdev.ID))
-	deviceParams = append(deviceParams, fmt.Sprintf(",mac=%s", netdev.MACAddress))
+		deviceParams = append(deviceParams, netdev.Type.QemuDeviceParam())
+		deviceParams = append(deviceParams, fmt.Sprintf(",netdev=%s", netdev.ID))
+		deviceParams = append(deviceParams, fmt.Sprintf(",mac=%s", netdev.MACAddress))
 
-	if netdev.Driver == VirtioNetPCI {
 		if netdev.Bus != "" {
 			deviceParams = append(deviceParams, fmt.Sprintf(",bus=%s", netdev.Bus))
 		}
@@ -426,41 +527,69 @@ func (netdev NetDevice) QemuParams(config *Config) []string {
 				deviceParams = append(deviceParams, fmt.Sprintf(",addr=%x", addr))
 			}
 		}
-	}
 
-	netdevParams = append(netdevParams, string(netdev.Type))
-	netdevParams = append(netdevParams, fmt.Sprintf(",id=%s", netdev.ID))
-	netdevParams = append(netdevParams, fmt.Sprintf(",ifname=%s", netdev.IFName))
-
-	if netdev.DownScript != "" {
-		netdevParams = append(netdevParams, fmt.Sprintf(",downscript=%s", netdev.DownScript))
-	}
-
-	if netdev.Script != "" {
-		netdevParams = append(netdevParams, fmt.Sprintf(",script=%s", netdev.Script))
-	}
-
-	if len(netdev.FDs) > 0 {
-		var fdParams []string
-
-		qemuFDs := config.appendFDs(netdev.FDs)
-
-		for _, fd := range qemuFDs {
-			fdParams = append(fdParams, fmt.Sprintf("%d", fd))
+		if netdev.DisableModern {
+			deviceParams = append(deviceParams, ",disable-modern=true")
 		}
 
-		netdevParams = append(netdevParams, fmt.Sprintf(",fds=%s", strings.Join(fdParams, ":")))
 	}
 
-	if netdev.VHost == true {
-		netdevParams = append(netdevParams, ",vhost=on")
+	// Macvtap can only be connected via fds
+	if (netdev.Type == MACVTAP) && (len(netdev.FDs) == 0) {
+		// Does not make sense to have more Queues that CPUs
+		// Specify the maximum number of queues possible for the
+		// current CPU configuration
+		netdev.FDs, _ = createMacvtapFds(netdev.ID, int(config.SMP.CPUs))
 	}
 
-	qemuParams = append(qemuParams, "-device")
-	qemuParams = append(qemuParams, strings.Join(deviceParams, ""))
+	if netdev.Type.QemuNetdevParam() != "" {
+		netdevParams = append(netdevParams, netdev.Type.QemuNetdevParam())
+		netdevParams = append(netdevParams, fmt.Sprintf(",id=%s", netdev.ID))
+		if netdev.VHost == true {
+			netdevParams = append(netdevParams, ",vhost=on")
+		}
 
-	qemuParams = append(qemuParams, "-netdev")
-	qemuParams = append(qemuParams, strings.Join(netdevParams, ""))
+		if len(netdev.FDs) > 0 {
+			var fdParams []string
+
+			qemuFDs := config.appendFDs(netdev.FDs)
+			for _, fd := range qemuFDs {
+				fdParams = append(fdParams, fmt.Sprintf("%d", fd))
+			}
+
+			netdevParams = append(netdevParams, fmt.Sprintf(",fds=%s", strings.Join(fdParams, ":")))
+
+			// https://www.linux-kvm.org/page/Multiqueue
+			// -netdev tap,vhost=on,queues=N
+			// enable mq and specify msix vectors in qemu cmdline
+			// (2N+2 vectors, N for tx queues, N for rx queues, 1 for config, and one for possible control vq)
+			// -device virtio-net-pci,mq=on,vectors=2N+2...
+			// enable mq in guest by 'ethtool -L eth0 combined $queue_num'
+			// Clearlinux automatically sets up the queues properly
+			// The agent implementation should do this to ensure that it is
+			// always set
+			vectors := len(qemuFDs)*2 + 2
+
+			// Note: We are appending to the device params here
+			deviceParams = append(deviceParams, ",mq=on")
+			deviceParams = append(deviceParams, fmt.Sprintf(",vectors=%s", vectors))
+		} else {
+			netdevParams = append(netdevParams, fmt.Sprintf(",ifname=%s", netdev.IFName))
+			if netdev.DownScript != "" {
+				netdevParams = append(netdevParams, fmt.Sprintf(",downscript=%s", netdev.DownScript))
+			}
+			if netdev.Script != "" {
+				netdevParams = append(netdevParams, fmt.Sprintf(",script=%s", netdev.Script))
+			}
+		}
+		qemuParams = append(qemuParams, "-netdev")
+		qemuParams = append(qemuParams, strings.Join(netdevParams, ""))
+	}
+
+	if netdev.Type.QemuDeviceParam() != "" {
+		qemuParams = append(qemuParams, "-device")
+		qemuParams = append(qemuParams, strings.Join(deviceParams, ""))
+	}
 
 	return qemuParams
 }
@@ -587,6 +716,32 @@ func (blkdev BlockDevice) QemuParams(config *Config) []string {
 
 	qemuParams = append(qemuParams, "-drive")
 	qemuParams = append(qemuParams, strings.Join(blkParams, ""))
+
+	return qemuParams
+}
+
+// VFIODevice represents a qemu vfio device meant for direct access by guest OS.
+type VFIODevice struct {
+	// Bus-Device-Function of device
+	BDF string
+}
+
+// Valid returns true if the VFIODevice structure is valid and complete.
+func (vfioDev VFIODevice) Valid() bool {
+	if vfioDev.BDF == "" {
+		return false
+	}
+
+	return true
+}
+
+// QemuParams returns the qemu parameters built out of this vfio device.
+func (vfioDev VFIODevice) QemuParams(config *Config) []string {
+	var qemuParams []string
+
+	deviceParam := fmt.Sprintf("vfio-pci,host=%s", vfioDev.BDF)
+	qemuParams = append(qemuParams, "-device")
+	qemuParams = append(qemuParams, deviceParam)
 
 	return qemuParams
 }

@@ -17,11 +17,14 @@
 package virtcontainers
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"runtime"
+	"strconv"
 
 	"github.com/01org/ciao/ssntp/uuid"
 	types "github.com/containernetworking/cni/pkg/types/current"
@@ -29,6 +32,32 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
+
+// NetworkInterworkingModel defines the type of container to
+// Virtcontainer network interworking models
+type NetInterworkingModel int
+
+const (
+	// ModelBridged uses a linux bridge to interconnect
+	// the container interface to the VM. This is the
+	// safe default that works for most cases except
+	// macvlan and ipvlan
+	ModelBridged NetInterworkingModel = iota
+
+	// ModelMacVtap can be used when the Container network
+	// interface can be bridged using macvtap
+	ModelMacVtap
+
+	// ModelEnlightened can be used when the Network plugins
+	// are enlightened to create VM native interfaces
+	// when requested by the runtime
+	ModelEnlightened
+)
+
+// DefaultNetInterworkingModel is a package level default
+// that determines how the VM should be connected to the
+// the container network interface
+var DefaultNetInterworkingModel NetInterworkingModel = ModelBridged
 
 // Introduces constants related to network routes.
 const (
@@ -47,12 +76,14 @@ type NetworkInterface struct {
 	HardAddr string
 }
 
-// NetworkInterfacePair defines a pair between TAP and virtual network interfaces.
+// NetworkInterfacePair defines a pair between VM and virtual network interfaces.
 type NetworkInterfacePair struct {
 	ID        string
 	Name      string
 	VirtIface NetworkInterface
 	TAPIface  NetworkInterface
+	NetInterworkingModel
+	VmFds []*os.File
 }
 
 // NetworkConfig is the network configuration related to a network.
@@ -159,7 +190,7 @@ func runNetworkCommon(networkNSPath string, cb func() error) error {
 func addNetworkCommon(pod Pod, networkNS *NetworkNamespace) error {
 	err := doNetNS(networkNS.NetNsPath, func(_ ns.NetNS) error {
 		for idx := range networkNS.Endpoints {
-			if err := bridgeNetworkPair(&(networkNS.Endpoints[idx].NetPair)); err != nil {
+			if err := xconnectVMNetwork(&(networkNS.Endpoints[idx].NetPair), true); err != nil {
 				return err
 			}
 		}
@@ -176,7 +207,7 @@ func addNetworkCommon(pod Pod, networkNS *NetworkNamespace) error {
 func removeNetworkCommon(networkNS NetworkNamespace) error {
 	return doNetNS(networkNS.NetNsPath, func(_ ns.NetNS) error {
 		for _, endpoint := range networkNS.Endpoints {
-			err := unBridgeNetworkPair(endpoint.NetPair)
+			err := xconnectVMNetwork(&(endpoint.NetPair), false)
 			if err != nil {
 				return err
 			}
@@ -199,6 +230,17 @@ func createLink(netHandle *netlink.Handle, name string, expectedLink netlink.Lin
 		newLink = &netlink.Tuntap{
 			LinkAttrs: netlink.LinkAttrs{Name: name},
 			Mode:      netlink.TUNTAP_MODE_TAP,
+		}
+	case (&netlink.Macvtap{}).Type():
+		newLink = &netlink.Macvtap{
+			netlink.Macvlan{
+				Mode: netlink.MACVLAN_MODE_BRIDGE,
+				LinkAttrs: netlink.LinkAttrs{
+					Name:        name,
+					TxQLen:      expectedLink.Attrs().TxQLen,
+					ParentIndex: expectedLink.Attrs().ParentIndex,
+				},
+			},
 		}
 	default:
 		return nil, fmt.Errorf("Unsupported link type %s", expectedLink.Type())
@@ -235,6 +277,159 @@ func getLinkByName(netHandle *netlink.Handle, name string, expectedLink netlink.
 	}
 
 	return nil, fmt.Errorf("Incorrect link type %s, expecting %s", link.Type(), expectedLink.Type())
+}
+
+func xconnectVMNetwork(netPair *NetworkInterfacePair, connect bool) error {
+	switch DefaultNetInterworkingModel {
+	case ModelBridged:
+		netPair.NetInterworkingModel = ModelBridged
+		if connect {
+			return bridgeNetworkPair(netPair)
+		} else {
+			return unBridgeNetworkPair(*netPair)
+		}
+	case ModelMacVtap:
+		netPair.NetInterworkingModel = ModelMacVtap
+		if connect {
+			return tapNetworkPair(netPair)
+		} else {
+			return untapNetworkPair(*netPair)
+		}
+	case ModelEnlightened:
+		return fmt.Errorf("Unsupported networking model")
+	default:
+		return fmt.Errorf("Invalid networking model")
+	}
+}
+
+func cleanupFds(fds []*os.File, numFds int) {
+
+	maxFds := len(fds)
+
+	if numFds < maxFds {
+		maxFds = numFds
+	}
+
+	for i := 0; i < maxFds; i++ {
+		_ = fds[i].Close()
+	}
+}
+
+func createMacvtapFds(name string, queues int) ([]*os.File, error) {
+
+	fds := make([]*os.File, queues)
+
+	ifIndexPath := path.Join("/sys/class/net", name, "ifindex")
+	fip, err := os.Open(ifIndexPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fip.Close() }()
+
+	scan := bufio.NewScanner(fip)
+	if !scan.Scan() {
+		return nil, fmt.Errorf("Unable to read tap index")
+	}
+
+	i, err := strconv.Atoi(scan.Text())
+	if err != nil {
+		return nil, err
+	}
+
+	//mq support
+	for q := 0; q < queues; q++ {
+
+		tapDev := fmt.Sprintf("/dev/tap%d", i)
+
+		f, err := os.OpenFile(tapDev, os.O_RDWR, 0666)
+		if err != nil {
+			cleanupFds(fds, q)
+			return nil, err
+		}
+		fds[q] = f
+	}
+
+	return fds, nil
+}
+
+func tapNetworkPair(netPair *NetworkInterfacePair) error {
+	netHandle, err := netlink.NewHandle()
+	if err != nil {
+		return err
+	}
+	defer netHandle.Delete()
+
+	vethLink, err := getLinkByName(netHandle, netPair.VirtIface.Name, &netlink.Veth{})
+	if err != nil {
+		return fmt.Errorf("Could not get veth interface: %s", err)
+	}
+	vethLinkAttrs := vethLink.Attrs()
+
+	// Attach the macvtap interface to the underlying container
+	// interface. Also picks relevant attributes from the parent
+	tapLink, err := createLink(netHandle, netPair.TAPIface.Name,
+		&netlink.Macvtap{
+			netlink.Macvlan{
+				LinkAttrs: netlink.LinkAttrs{
+					TxQLen:      vethLinkAttrs.TxQLen,
+					ParentIndex: vethLinkAttrs.Index,
+				},
+			},
+		})
+
+	if err != nil {
+		return fmt.Errorf("Could not create TAP interface: %s", err)
+	}
+
+	// Setup the multiqueue fds to be consumed by QEMU as macvtap cannot
+	// be directly connected
+	// Idealy we want
+	// netdev.FDs, err = createMacvtapFds(netdev.ID, int(config.SMP.CPUs))
+
+	// We do not have global context here, hence a manifest constant
+	// that matches our minimum vCPU configuration
+	// Another option is to defer this to ciao qemu library which does have
+	// global context but cannot handle errors when setting up the network
+	netPair.VmFds, err = createMacvtapFds(netPair.TAPIface.Name, 2)
+	if err != nil {
+		return fmt.Errorf("Could not setup macvtap fds %s: %s", netPair.TAPIface, err)
+	}
+
+	// Save the veth MAC address to the TAP so that it can later be used
+	// to build the hypervisor command line. This MAC address has to be
+	// the one inside the VM in order to avoid any firewall issues. The
+	// bridge created by the network plugin on the host actually expects
+	// to see traffic from this MAC address and not another one.
+	tapHardAddr := vethLinkAttrs.HardwareAddr
+	netPair.TAPIface.HardAddr = vethLinkAttrs.HardwareAddr.String()
+
+	if err := netHandle.LinkSetMTU(tapLink, vethLinkAttrs.MTU); err != nil {
+		return fmt.Errorf("Could not set TAP MTU %d: %s", vethLinkAttrs.MTU, err)
+	}
+
+	hardAddr, err := net.ParseMAC(netPair.VirtIface.HardAddr)
+	if err != nil {
+		return err
+	}
+	if err := netHandle.LinkSetHardwareAddr(vethLink, hardAddr); err != nil {
+		return fmt.Errorf("Could not set MAC address %s for veth interface %s: %s",
+			netPair.VirtIface.HardAddr, netPair.VirtIface.Name, err)
+	}
+
+	if err := netHandle.LinkSetUp(vethLink); err != nil {
+		return fmt.Errorf("Could not enable veth %s: %s", netPair.VirtIface.Name, err)
+	}
+
+	if err := netHandle.LinkSetHardwareAddr(tapLink, tapHardAddr); err != nil {
+		return fmt.Errorf("Could not set MAC address %s for veth interface %s: %s",
+			netPair.VirtIface.HardAddr, netPair.VirtIface.Name, err)
+	}
+
+	if err := netHandle.LinkSetUp(tapLink); err != nil {
+		return fmt.Errorf("Could not enable TAP %s: %s", netPair.TAPIface.Name, err)
+	}
+
+	return nil
 }
 
 func bridgeNetworkPair(netPair *NetworkInterfacePair) error {
@@ -302,6 +497,35 @@ func bridgeNetworkPair(netPair *NetworkInterfacePair) error {
 
 	if err := netHandle.LinkSetUp(bridgeLink); err != nil {
 		return fmt.Errorf("Could not enable bridge %s: %s", netPair.Name, err)
+	}
+
+	return nil
+}
+
+func untapNetworkPair(netPair NetworkInterfacePair) error {
+	netHandle, err := netlink.NewHandle()
+	if err != nil {
+		return err
+	}
+	defer netHandle.Delete()
+
+	tapLink, err := getLinkByName(netHandle, netPair.TAPIface.Name, &netlink.Tuntap{})
+	if err != nil {
+		return fmt.Errorf("Could not get TAP interface: %s", err)
+	}
+
+	if err := netHandle.LinkDel(tapLink); err != nil {
+		return fmt.Errorf("Could not remove TAP %s: %s", netPair.TAPIface.Name, err)
+	}
+
+	vethLink, err := getLinkByName(netHandle, netPair.VirtIface.Name, &netlink.Veth{})
+	if err != nil {
+		// The veth pair is not totally managed by virtcontainers
+		virtLog.Warn("Could not get veth interface: %s", err)
+	} else {
+		if err := netHandle.LinkSetDown(vethLink); err != nil {
+			return fmt.Errorf("Could not disable veth %s: %s", netPair.VirtIface.Name, err)
+		}
 	}
 
 	return nil
