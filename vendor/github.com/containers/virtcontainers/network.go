@@ -17,14 +17,11 @@
 package virtcontainers
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"net"
 	"os"
-	"path"
 	"runtime"
-	"strconv"
 
 	"github.com/01org/ciao/ssntp/uuid"
 	types "github.com/containernetworking/cni/pkg/types/current"
@@ -319,31 +316,13 @@ func cleanupFds(fds []*os.File, numFds int) {
 	}
 }
 
-func createMacvtapFds(name string, queues int) ([]*os.File, error) {
-
+func createMacvtapFds(linkIndex int, queues int) ([]*os.File, error) {
 	fds := make([]*os.File, queues)
-
-	ifIndexPath := path.Join("/sys/class/net", name, "ifindex")
-	fip, err := os.Open(ifIndexPath)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = fip.Close() }()
-
-	scan := bufio.NewScanner(fip)
-	if !scan.Scan() {
-		return nil, fmt.Errorf("Unable to read tap index")
-	}
-
-	i, err := strconv.Atoi(scan.Text())
-	if err != nil {
-		return nil, err
-	}
 
 	//mq support
 	for q := 0; q < queues; q++ {
 
-		tapDev := fmt.Sprintf("/dev/tap%d", i)
+		tapDev := fmt.Sprintf("/dev/tap%d", linkIndex)
 
 		f, err := os.OpenFile(tapDev, os.O_RDWR, 0666)
 		if err != nil {
@@ -394,7 +373,7 @@ func tapNetworkPair(netPair *NetworkInterfacePair) error {
 	// that matches our minimum vCPU configuration
 	// Another option is to defer this to ciao qemu library which does have
 	// global context but cannot handle errors when setting up the network
-	netPair.VmFds, err = createMacvtapFds(netPair.TAPIface.Name, 2)
+	netPair.VmFds, err = createMacvtapFds(tapLink.Attrs().Index, 2)
 	if err != nil {
 		return fmt.Errorf("Could not setup macvtap fds %s: %s", netPair.TAPIface, err)
 	}
