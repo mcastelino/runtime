@@ -55,6 +55,7 @@ const (
 // that determines how the VM should be connected to the
 // the container network interface
 var DefaultNetInterworkingModel NetInterworkingModel = ModelMacVtap
+//var DefaultNetInterworkingModel NetInterworkingModel = ModelBridged
 
 // Introduces constants related to network routes.
 const (
@@ -364,19 +365,6 @@ func tapNetworkPair(netPair *NetworkInterfacePair) error {
 		return fmt.Errorf("Could not create TAP interface: %s", err)
 	}
 
-	// Setup the multiqueue fds to be consumed by QEMU as macvtap cannot
-	// be directly connected
-	// Idealy we want
-	// netdev.FDs, err = createMacvtapFds(netdev.ID, int(config.SMP.CPUs))
-
-	// We do not have global context here, hence a manifest constant
-	// that matches our minimum vCPU configuration
-	// Another option is to defer this to ciao qemu library which does have
-	// global context but cannot handle errors when setting up the network
-	netPair.VmFds, err = createMacvtapFds(tapLink.Attrs().Index, 2)
-	if err != nil {
-		return fmt.Errorf("Could not setup macvtap fds %s: %s", netPair.TAPIface, err)
-	}
 
 	// Save the veth MAC address to the TAP so that it can later be used
 	// to build the hypervisor command line. This MAC address has to be
@@ -410,6 +398,20 @@ func tapNetworkPair(netPair *NetworkInterfacePair) error {
 
 	if err := netHandle.LinkSetUp(tapLink); err != nil {
 		return fmt.Errorf("Could not enable TAP %s: %s", netPair.TAPIface.Name, err)
+	}
+
+	// Setup the multiqueue fds to be consumed by QEMU as macvtap cannot
+	// be directly connected
+	// Idealy we want
+	// netdev.FDs, err = createMacvtapFds(netdev.ID, int(config.SMP.CPUs))
+
+	// We do not have global context here, hence a manifest constant
+	// that matches our minimum vCPU configuration
+	// Another option is to defer this to ciao qemu library which does have
+	// global context but cannot handle errors when setting up the network
+	netPair.VmFds, err = createMacvtapFds(tapLink.Attrs().Index, 2)
+	if err != nil {
+		return fmt.Errorf("Could not setup macvtap fds %s: %s", netPair.TAPIface, err)
 	}
 
 	return nil
