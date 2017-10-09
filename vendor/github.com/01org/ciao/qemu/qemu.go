@@ -534,13 +534,17 @@ func (netdev NetDevice) QemuParams(config *Config) []string {
 
 	}
 
-	// Macvtap can only be connected via fds
-	if (netdev.Type == MACVTAP) && (len(netdev.FDs) == 0) {
-		// Does not make sense to have more Queues that CPUs
-		// Specify the maximum number of queues possible for the
-		// current CPU configuration
-		netdev.FDs, _ = createMacvtapFds(netdev.ID, int(config.SMP.CPUs))
-	}
+	/*
+
+		// Macvtap can only be connected via fds
+		if (netdev.Type == MACVTAP) && (len(netdev.FDs) == 0) {
+			// Does not make sense to have more Queues that CPUs
+			// Specify the maximum number of queues possible for the
+			// current CPU configuration
+			netdev.FDs, _ = createMacvtapFds(netdev.ID, int(config.SMP.CPUs))
+		}
+
+	*/
 
 	if netdev.Type.QemuNetdevParam() != "" {
 		netdevParams = append(netdevParams, netdev.Type.QemuNetdevParam())
@@ -572,7 +576,7 @@ func (netdev NetDevice) QemuParams(config *Config) []string {
 
 			// Note: We are appending to the device params here
 			deviceParams = append(deviceParams, ",mq=on")
-			deviceParams = append(deviceParams, fmt.Sprintf(",vectors=%s", vectors))
+			deviceParams = append(deviceParams, fmt.Sprintf(",vectors=%d", vectors))
 		} else {
 			netdevParams = append(netdevParams, fmt.Sprintf(",ifname=%s", netdev.IFName))
 			if netdev.DownScript != "" {
