@@ -4,7 +4,7 @@
 [[projects]]
   name = "github.com/01org/ciao"
   packages = ["qemu"]
-  revision = "b2a8a2ecea1318ae28a0861191ec385532491b5a"
+  revision = "95b1aed247b9b26ec5158a30dc39922cf202988b"
 
 [[projects]]
   name = "github.com/BurntSushi/toml"
@@ -29,7 +29,7 @@
 [[projects]]
   name = "github.com/containers/virtcontainers"
   packages = [".","pkg/annotations","pkg/cni","pkg/ethtool","pkg/hyperstart","pkg/oci","pkg/uuid","pkg/vcMock"]
-  revision = "506f076ba79c77ae00da9daf60e4fed747cd8ab3"
+  revision = "aa91b939fbd3f3b3073492e3cee9a208c11f4583"
 
 [[projects]]
   name = "github.com/davecgh/go-spew"
@@ -91,7 +91,7 @@
 [[projects]]
   name = "github.com/vishvananda/netlink"
   packages = [".","nl"]
-  revision = "b7fbf1f5291ecf8ae5179d3202e914cb98cfe400"
+  revision = "c2a3de3b38bd00f07290c3c5e12b4dbc04ec8666"
 
 [[projects]]
   name = "github.com/vishvananda/netns"
@@ -111,6 +111,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "bee732b22990fc7ebc0225845b8cf7648e9a76a813deec226fdbfebff948ad51"
+  inputs-digest = "6d92c13865db484aa83b9b7d823463ac81445feb581e857d641385e8da8a4154"
   solver-name = "gps-cdcl"
   solver-version = 1
